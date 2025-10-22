@@ -1,6 +1,12 @@
 ﻿// LPatchDLL.cpp  —  Minimal Unity-safe BLE advertisements + CGX detection
 // No precompiled headers required. Build x64, /std:c++17, link windowsapp.
-
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // DWORD, GetCurrentThreadId, RPC_E_CHANGED_MODE
 #include <atomic>
 #include <cstdint>
 #include <cwchar>
@@ -58,7 +64,9 @@ DEFINE_GUID(kCgxServiceUuid, 0x2456e1b9, 0x26e2, 0x8f83, 0xe7, 0x44, 0xf3, 0x4f,
 DEFINE_GUID(kCgxChar1Uuid, 0x2456e1b9, 0x26e2, 0x8f83, 0xe7, 0x44, 0xf3, 0x4f, 0x01, 0xe9, 0xd7, 0x03);
 DEFINE_GUID(kCgxChar2Uuid, 0x2456e1b9, 0x26e2, 0x8f83, 0xe7, 0x44, 0xf3, 0x4f, 0x01, 0xe9, 0xd7, 0x04);
 // -------------------- init / shutdown --------------------
-static std::atomic_bool g_inited{ false };
+
+static std::atomic<DWORD> g_initTid{ 0 };   // thread that called Ble_Init
+static std::atomic<bool>  g_inited{ false };
 
 extern "C" __declspec(dllexport) int __cdecl Ble_Ping() { return 42; }
 
@@ -66,24 +74,58 @@ extern "C" __declspec(dllexport) const wchar_t* __cdecl Ble_Version() {
     static const wchar_t* kVer = L"LPatchDLL 1.0 (CGX BLE stream)";
     return kVer;
 }
+// ---------- Streaming state ----------
+static BluetoothLEDevice                         g_dev{ nullptr };
+static GattDeviceService                         g_svc{ nullptr };
+static GattCharacteristic                        g_ch1{ nullptr };
+static GattCharacteristic                        g_ch2{ nullptr };
+static event_token                               g_tok1{};
+static event_token                               g_tok2{};
+static std::atomic_bool                          g_subscribed{ false };
+static winrt::hstring                            g_curDeviceId;
+
+// For PollData queue (if you implemented it)
+struct NativeChunk {
+    std::vector<uint8_t> bytes;
+    guid                 charUuid{};
+    int64_t              ts100ns{ 0 };
+};
+
+static std::mutex              g_dataMx;
+static std::deque<NativeChunk> g_dataQ;
+static size_t                  g_queuedBytes = 0;
+static constexpr size_t        kMaxQueuedBytes = (1u << 20); // 1 MB cap
 
 extern "C" __declspec(dllexport) bool __cdecl Ble_Init() {
-    if (g_inited.load(std::memory_order_acquire)) return true;
-    try {
-        // MTA is fine for AdvertisementWatcher; avoids STA headaches.
-        winrt::init_apartment(apartment_type::multi_threaded);
-        g_inited.store(true, std::memory_order_release);
-        ClearError();
+    // If already initialized on *this* thread, it's fine.
+    if (g_inited.load(std::memory_order_acquire) && g_initTid.load() == GetCurrentThreadId()) {
         return true;
     }
-    catch (hresult_error const& ex) {
-        SaveError(L"Ble_Init: %s", ex.message().c_str());
-        return false;
+
+    try {
+        // Attempt to initialize a WinRT apartment for this thread.
+        // If the thread is already STA/MTA in a conflicting mode, C++/WinRT throws
+        // hresult_error with RPC_E_CHANGED_MODE — we treat that as "already ok".
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    }
+    catch (winrt::hresult_error const& e) {
+        if ((uint32_t)e.code() == (uint32_t)RPC_E_CHANGED_MODE) {
+            // Different apartment already set — safe to proceed.
+        }
+        else {
+            SaveError(L"Ble_Init: %s", e.message().c_str());
+            return false;
+        }
     }
     catch (...) {
-        SaveError(L"Ble_Init: unknown");
+        SaveError(L"Ble_Init: unknown exception");
         return false;
     }
+
+    g_initTid.store(GetCurrentThreadId(), std::memory_order_release);
+    g_inited.store(true, std::memory_order_release);
+    ClearError();
+    return true;
 }
 
 extern "C" __declspec(dllexport) void __cdecl Ble_Shutdown() {
@@ -96,7 +138,47 @@ extern "C" __declspec(dllexport) void __cdecl Ble_Shutdown() {
     }
     catch (...) { /* swallow */ }
 }
+extern "C" __declspec(dllexport) void __cdecl Ble_Quit() {
+    try {
+        // Stop notifications if active
+        if (g_subscribed.exchange(false)) {
+            try {
+                if (g_ch1) g_ch1.ValueChanged(g_tok1);
+                if (g_ch2) g_ch2.ValueChanged(g_tok2);
+            }
+            catch (...) {}
+        }
+        g_tok1 = {}; g_tok2 = {};
+        if (g_ch1) {
+            auto _ = g_ch1.WriteClientCharacteristicConfigurationDescriptorAsync(
+                Windows::Devices::Bluetooth::GenericAttributeProfile::GattClientCharacteristicConfigurationDescriptorValue::None).get();
+        }
+        if (g_ch2) {
+            auto _ = g_ch2.WriteClientCharacteristicConfigurationDescriptorAsync(
+                Windows::Devices::Bluetooth::GenericAttributeProfile::GattClientCharacteristicConfigurationDescriptorValue::None).get();
+        }
+        g_ch1 = nullptr; g_ch2 = nullptr; g_svc = nullptr; g_dev = nullptr;
 
+        // Clear the data queue
+        {
+            std::lock_guard<std::mutex> lk(g_dataMx);
+            g_dataQ.clear();
+            g_queuedBytes = 0;
+        }
+
+        // Only uninit if this thread was the one that initialized
+        if (g_inited.load() && g_initTid.load() == GetCurrentThreadId()) {
+            try { winrt::uninit_apartment(); }
+            catch (...) {}
+            g_inited.store(false);
+            g_initTid.store(0);
+        }
+
+        ClearError();
+    }
+    catch (winrt::hresult_error const& e) { SaveError(L"Ble_Quit: %s", e.message().c_str()); }
+    catch (...) { SaveError(L"Ble_Quit: unknown exception"); }
+}
 // -------------------- advertisement queue --------------------
 
 struct AdvUpdate {
@@ -258,29 +340,7 @@ extern "C" __declspec(dllexport) bool __cdecl HasCgxService(const wchar_t* devic
         return false;
     }
 }
-// ---------- Streaming state ----------
-static BluetoothLEDevice                         g_dev{ nullptr };
-static GattDeviceService                         g_svc{ nullptr };
-static GattCharacteristic                        g_ch1{ nullptr };
-static GattCharacteristic                        g_ch2{ nullptr };
-static event_token                               g_tok1{};
-static event_token                               g_tok2{};
-static std::atomic_bool                          g_subscribed{ false };
-static winrt::hstring                            g_curDeviceId;
 
-// We’ll enqueue raw notification bytes + which characteristic they came from
-struct NativeChunk {
-    std::vector<uint8_t> bytes;
-    guid                charUuid;
-    int64_t             ts100ns;   // timestamp in 100ns ticks
-};
-
-static std::mutex                 g_dataMx;
-static std::deque<NativeChunk>    g_dataQ;
-
-// Backpressure limit to avoid unbounded growth if Unity stalls
-static constexpr size_t kMaxQueuedBytes = 1 << 20; // ~1 MB
-static size_t                        g_queuedBytes = 0;
 
 static inline void EnqueueChunk(std::vector<uint8_t>&& v, guid const& chUuid) {
     std::lock_guard<std::mutex> lk(g_dataMx);
