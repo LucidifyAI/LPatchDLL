@@ -63,17 +63,7 @@ extern "C" __declspec(dllexport) void __cdecl GetError(ErrorMessage* outMsg) {
 DEFINE_GUID(kCgxServiceUuid, 0x2456e1b9, 0x26e2, 0x8f83, 0xe7, 0x44, 0xf3, 0x4f, 0x01, 0xe9, 0xd7, 0x01);
 DEFINE_GUID(kCgxChar1Uuid, 0x2456e1b9, 0x26e2, 0x8f83, 0xe7, 0x44, 0xf3, 0x4f, 0x01, 0xe9, 0xd7, 0x03);
 DEFINE_GUID(kCgxChar2Uuid, 0x2456e1b9, 0x26e2, 0x8f83, 0xe7, 0x44, 0xf3, 0x4f, 0x01, 0xe9, 0xd7, 0x04);
-// -------------------- init / shutdown --------------------
 
-static std::atomic<DWORD> g_initTid{ 0 };   // thread that called Ble_Init
-static std::atomic<bool>  g_inited{ false };
-
-extern "C" __declspec(dllexport) int __cdecl Ble_Ping() { return 42; }
-
-extern "C" __declspec(dllexport) const wchar_t* __cdecl Ble_Version() {
-    static const wchar_t* kVer = L"LPatchDLL 1.0 (CGX BLE stream)";
-    return kVer;
-}
 // ---------- Streaming state ----------
 static BluetoothLEDevice                         g_dev{ nullptr };
 static GattDeviceService                         g_svc{ nullptr };
@@ -95,6 +85,33 @@ static std::mutex              g_dataMx;
 static std::deque<NativeChunk> g_dataQ;
 static size_t                  g_queuedBytes = 0;
 static constexpr size_t        kMaxQueuedBytes = (1u << 20); // 1 MB cap
+
+// -------------------- init / shutdown --------------------
+
+static std::atomic<DWORD> g_initTid{ 0 };   // thread that called Ble_Init
+static std::atomic<bool>  g_inited{ false };
+
+extern "C" __declspec(dllexport) int __cdecl Ble_Ping() { return 42; }
+
+extern "C" __declspec(dllexport) const wchar_t* __cdecl Ble_Version() {
+    static const wchar_t* kVer = L"LPatchDLL 1.0 (CGX BLE stream)";
+    return kVer;
+}
+//=======================Close functions
+// Helper: explicitly Close() any WinRT object that supports IClosable
+// Helper: explicitly Close() any WinRT object that supports IClosable (C++17-safe)
+template <typename T>
+static inline void CloseIfIClosable(T& obj) {
+    if (!obj) return;
+    try {
+        if (auto closable = obj.try_as<winrt::Windows::Foundation::IClosable>()) {
+            closable.Close();
+        }
+    }
+    catch (...) { /* swallow */ }
+    obj = nullptr;
+}
+
 
 extern "C" __declspec(dllexport) bool __cdecl Ble_Init() {
     // If already initialized on *this* thread, it's fine.
@@ -149,36 +166,52 @@ extern "C" __declspec(dllexport) void __cdecl Ble_Quit() {
             catch (...) {}
         }
         g_tok1 = {}; g_tok2 = {};
-        if (g_ch1) {
-            auto _ = g_ch1.WriteClientCharacteristicConfigurationDescriptorAsync(
-                Windows::Devices::Bluetooth::GenericAttributeProfile::GattClientCharacteristicConfigurationDescriptorValue::None).get();
-        }
-        if (g_ch2) {
-            auto _ = g_ch2.WriteClientCharacteristicConfigurationDescriptorAsync(
-                Windows::Devices::Bluetooth::GenericAttributeProfile::GattClientCharacteristicConfigurationDescriptorValue::None).get();
-        }
-        g_ch1 = nullptr; g_ch2 = nullptr; g_svc = nullptr; g_dev = nullptr;
 
-        // Clear the data queue
+        try {
+            if (g_ch1) g_ch1.WriteClientCharacteristicConfigurationDescriptorAsync(
+                Windows::Devices::Bluetooth::GenericAttributeProfile::GattClientCharacteristicConfigurationDescriptorValue::None).get();
+        }
+        catch (...) {}
+        try {
+            if (g_ch2) g_ch2.WriteClientCharacteristicConfigurationDescriptorAsync(
+                Windows::Devices::Bluetooth::GenericAttributeProfile::GattClientCharacteristicConfigurationDescriptorValue::None).get();
+        }
+        catch (...) {}
+
+        // NEW: close session and objects explicitly
+        // Close the GATT session via the service, if available
+        try {
+            if (g_svc) {
+                auto sess = g_svc.Session();   // Session hangs off the service
+                if (sess) {
+                    // GattSession implements IClosable, so Close() is available
+                    sess.Close();
+                }
+            }
+        }
+        catch (...) {}
+        CloseIfIClosable(g_ch1);
+        CloseIfIClosable(g_ch2);
+        CloseIfIClosable(g_svc);
+        CloseIfIClosable(g_dev);
+
+        // Clear queue (you already do this)
         {
             std::lock_guard<std::mutex> lk(g_dataMx);
             g_dataQ.clear();
             g_queuedBytes = 0;
         }
 
-        // Only uninit if this thread was the one that initialized
-        if (g_inited.load() && g_initTid.load() == GetCurrentThreadId()) {
-            try { winrt::uninit_apartment(); }
-            catch (...) {}
-            g_inited.store(false);
-            g_initTid.store(0);
-        }
+        // Optional: tiny back-off helps after back-to-back reconnect attempts
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
+        // Leave the apartment alone (Unity often keeps WinRT state)
         ClearError();
     }
     catch (winrt::hresult_error const& e) { SaveError(L"Ble_Quit: %s", e.message().c_str()); }
     catch (...) { SaveError(L"Ble_Quit: unknown exception"); }
 }
+
 // -------------------- advertisement queue --------------------
 
 struct AdvUpdate {
@@ -292,8 +325,13 @@ extern "C" __declspec(dllexport) bool __cdecl ResolveIdFromAddress(uint64_t addr
         auto dev = BluetoothLEDevice::FromBluetoothAddressAsync(address).get();
         if (!dev) { SaveError(L"ResolveIdFromAddress: device null"); return false; }
 
-        winrt::hstring id = dev.DeviceInformation().Id();   // explicit type
+        winrt::hstring id = dev.DeviceInformation().Id();
         wcsncpy_s(outId, outChars, id.c_str(), _TRUNCATE);
+
+        // NEW: explicitly close the transient device
+        try { winrt::Windows::Foundation::IClosable(dev).Close(); }
+        catch (...) {}
+
         ClearError();
         return true;
     }
@@ -306,6 +344,7 @@ extern "C" __declspec(dllexport) bool __cdecl ResolveIdFromAddress(uint64_t addr
         return false;
     }
 }
+
 
 // -------------------- CGX service presence --------------------
 static bool HasServiceOn(BluetoothLEDevice const& dev, guid const& svc, BluetoothCacheMode mode) {
@@ -320,6 +359,7 @@ extern "C" __declspec(dllexport) bool __cdecl HasCgxService(const wchar_t* devic
         if (!dev) { SaveError(L"HasCgxService: FromIdAsync null"); return false; }
 
         bool ok = false;
+        // NEW: bias Uncached first unless caller *insists* on cached
         if (preferCached) {
             ok = HasServiceOn(dev, kCgxServiceUuid, BluetoothCacheMode::Cached)
                 || HasServiceOn(dev, kCgxServiceUuid, BluetoothCacheMode::Uncached);
@@ -328,6 +368,11 @@ extern "C" __declspec(dllexport) bool __cdecl HasCgxService(const wchar_t* devic
             ok = HasServiceOn(dev, kCgxServiceUuid, BluetoothCacheMode::Uncached)
                 || HasServiceOn(dev, kCgxServiceUuid, BluetoothCacheMode::Cached);
         }
+
+        // NEW: explicitly close probe device before returning
+        try { winrt::Windows::Foundation::IClosable(dev).Close(); }
+        catch (...) {}
+
         ClearError();
         return ok;
     }
@@ -340,6 +385,7 @@ extern "C" __declspec(dllexport) bool __cdecl HasCgxService(const wchar_t* devic
         return false;
     }
 }
+
 
 
 static inline void EnqueueChunk(std::vector<uint8_t>&& v, guid const& chUuid) {
@@ -472,17 +518,38 @@ extern "C" __declspec(dllexport) bool __cdecl UnsubscribeCgxEeg(const wchar_t* /
             catch (...) {}
         }
         g_tok1 = {}; g_tok2 = {};
-        if (g_ch1) {
-            auto _ = g_ch1.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::None).get();
-        }
-        if (g_ch2) {
-            auto _ = g_ch2.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::None).get();
-        }
-        g_ch1 = nullptr; g_ch2 = nullptr; g_svc = nullptr; g_dev = nullptr;
 
-        // Optionally clear queue
+        try {
+            if (g_ch1) g_ch1.WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::None).get();
+        }
+        catch (...) {}
+        try {
+            if (g_ch2) g_ch2.WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::None).get();
+        }
+        catch (...) {}
+
+        // NEW: close session (if any) *before* closing chars
+        // Close the GATT session via the service, if available
+        try {
+            if (g_svc) {
+                auto sess = g_svc.Session();   // Session hangs off the service
+                if (sess) {
+                    // GattSession implements IClosable, so Close() is available
+                    sess.Close();
+                }
+            }
+        }
+        catch (...) {}
+
+        // NEW: explicit Close() in leaf→root order
+        CloseIfIClosable(g_ch1);
+        CloseIfIClosable(g_ch2);
+        CloseIfIClosable(g_svc);
+        CloseIfIClosable(g_dev);
+
+        // Clear data queue (as you already do)
         {
             std::lock_guard<std::mutex> lk(g_dataMx);
             g_dataQ.clear(); g_queuedBytes = 0;
@@ -493,6 +560,7 @@ extern "C" __declspec(dllexport) bool __cdecl UnsubscribeCgxEeg(const wchar_t* /
     catch (hresult_error const& ex) { SaveError(L"UnsubscribeCgxEeg: %s", ex.message().c_str()); return false; }
     catch (...) { SaveError(L"UnsubscribeCgxEeg: unknown"); return false; }
 }
+
 extern "C" __declspec(dllexport) bool __cdecl PollData(BLEDataNative* out, bool /*block*/) {
     if (!out) return false;
     std::lock_guard<std::mutex> lk(g_dataMx);
