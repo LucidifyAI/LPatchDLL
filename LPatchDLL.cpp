@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <cstdarg>   // <- for va_list, va_start, va_end
+#include <deque>
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
@@ -41,14 +42,27 @@ using namespace Windows::Storage::Streams;
 static std::mutex g_errMx;
 static wchar_t g_err[2048] = L"OK";
 
+// --- unified reassembly state (protected by g_dataMx) ---
+static std::vector<uint8_t> g_pktBuf;
+static bool                 g_haveSync = false;
+static const uint8_t        kSyncA = 0xFF;
+static const uint8_t        kSyncB = 0xF8;
+
 static void ClearError() { std::lock_guard<std::mutex> lk(g_errMx); wcscpy_s(g_err, L"OK"); }
 static void SaveError(const wchar_t* fmt, ...) {
     std::lock_guard<std::mutex> lk(g_errMx);
     va_list ap; va_start(ap, fmt); vswprintf_s(g_err, fmt, ap); va_end(ap);
 }
-
+static event_token g_advRecvTok{};
+static event_token g_advStoppedTok{};
 // Struct that matches C# ErrorMessage
 struct ErrorMessage { wchar_t msg[2048]; };
+
+// globals
+static std::atomic<bool> g_resetRequested{ false };
+static inline bool IsSync(uint8_t b) { return b == 0xFF || b == 0xF8; }
+static void RequestAssemblerReset() { g_resetRequested.store(true, std::memory_order_relaxed); }
+
 
 extern "C" __declspec(dllexport) void __cdecl GetError(ErrorMessage* outMsg) {
     if (!outMsg) return;
@@ -90,6 +104,40 @@ static constexpr size_t        kMaxQueuedBytes = (1u << 20); // 1 MB cap
 
 static std::atomic<DWORD> g_initTid{ 0 };   // thread that called Ble_Init
 static std::atomic<bool>  g_inited{ false };
+// Feed raw BLE bytes (from either characteristic) and emit full 37B frames
+static void EnqueueAssembled(std::vector<uint8_t>&& v)
+{
+    if (v.empty()) return;
+    std::lock_guard<std::mutex> lk(g_dataMx);        // serialize both EEG streams
+
+    if (g_resetRequested.exchange(false)) { g_pktBuf.clear(); g_haveSync = false; }
+
+    auto emit_frame = [&](const std::vector<uint8_t>& frame) {
+        // Cap queue to 1 MB (matches existing policy)
+        while (g_queuedBytes + frame.size() > kMaxQueuedBytes && !g_dataQ.empty()) {
+            g_queuedBytes -= g_dataQ.front().bytes.size();
+            g_dataQ.pop_front();
+        }
+        NativeChunk nc;
+        nc.bytes = frame;                      // copy into a new node
+        nc.charUuid = kCgxServiceUuid;           // mark as unified EEG stream
+        nc.ts100ns = winrt::clock::now().time_since_epoch().count();
+        g_queuedBytes += nc.bytes.size();
+        g_dataQ.emplace_back(std::move(nc));
+    };
+
+    // Byte-wise state machine: find sync, then fill to 37 bytes
+    for (uint8_t b : v)
+    {
+        if (!g_haveSync) { if (IsSync(b)) { g_pktBuf.clear(); g_pktBuf.push_back(b); g_haveSync = true; } continue; }
+
+        if (IsSync(b) && g_pktBuf.size() < 37) { g_pktBuf.clear(); g_pktBuf.push_back(b); }
+        else { g_pktBuf.push_back(b); }
+
+        if (g_pktBuf.size() == 37) { emit_frame(g_pktBuf); g_pktBuf.clear(); g_haveSync = false; }
+        else if (g_pktBuf.size() > 37) { g_pktBuf.clear(); g_haveSync = IsSync(b); if (g_haveSync) g_pktBuf.push_back(b); }
+    }
+}
 
 extern "C" __declspec(dllexport) int __cdecl Ble_Ping() { return 42; }
 
@@ -249,7 +297,7 @@ extern "C" __declspec(dllexport) void __cdecl StartAdvertisementWatch() {
         g_watcher = BluetoothLEAdvertisementWatcher();
         g_watcher.ScanningMode(BluetoothLEScanningMode::Active);
 
-        g_watcher.Received([](auto const&, BluetoothLEAdvertisementReceivedEventArgs const& args) {
+        g_advRecvTok = g_watcher.Received([](auto const&, BluetoothLEAdvertisementReceivedEventArgs const& args) {
             AdvUpdate u{}; // zero-init
             u.address = args.BluetoothAddress();
             u.rssi = (int8_t)args.RawSignalStrengthInDBm();
@@ -292,17 +340,56 @@ extern "C" __declspec(dllexport) void __cdecl StartAdvertisementWatch() {
     }
 }
 
-extern "C" __declspec(dllexport) void __cdecl StopAdvertisementWatch() {
+extern "C" __declspec(dllexport) void __cdecl StopAdvertisementWatch()
+{
     try {
-        if (g_watcher) {
-            g_watcher.Stop();
-            g_watcher = nullptr;
-        }
         g_advRunning.store(false);
+
+        // Grab and clear the global without holding other locks
+        auto watcher = std::move(g_watcher);
+        g_watcher = nullptr;
+        if (!watcher) { ClearError(); return; }
+
+        // 1) Revoke handlers first (ignore errors)
+        try { watcher.Received(g_advRecvTok); }
+        catch (...) {}
+        try { watcher.Stopped(g_advStoppedTok); }
+        catch (...) {}
+        g_advRecvTok = {}; g_advStoppedTok = {};
+
+        // 2) Stop the watcher off the Unity main thread with a timeout
+        std::atomic<bool> done{ false };
+        std::thread([w = std::move(watcher), &done]() mutable {
+            try {
+                // Make sure we’re in the same apartment type you used to create it.
+                // If you created on MTA at startup, ensure this thread is also MTA:
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+
+                // Only call Stop if it looks started
+                using Status = winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementWatcherStatus;
+                auto st = w.Status();
+                if (st == Status::Started || st == Status::Stopping || st == Status::Created) {
+                    w.Stop();
+                }
+            }
+            catch (...) {}
+            done.store(true, std::memory_order_release);
+        }).detach();
+
+        // 3) Wait briefly so we don’t leak watchers, but don’t hang the editor
+        using namespace std::chrono_literals;
+        auto t0 = std::chrono::steady_clock::now();
+        while (!done.load(std::memory_order_acquire) &&
+            std::chrono::steady_clock::now() - t0 < 1500ms)
+        {
+            std::this_thread::sleep_for(10ms);
+        }
+
         ClearError();
     }
-    catch (...) { /**/ }
+    catch (...) { /* swallow to avoid crashing Unity */ }
 }
+
 
 extern "C" __declspec(dllexport) bool __cdecl PollAdvertisement(AdvUpdate* out) {
     if (!out) return false;
@@ -433,6 +520,7 @@ extern "C" __declspec(dllexport) bool __cdecl SubscribeCgxEeg(const wchar_t* dev
     if (!deviceId || !*deviceId) { SaveError(L"SubscribeCgxEeg: empty deviceId"); return false; }
     try {
         // Tear down any previous state
+        RequestAssemblerReset();
         if (g_subscribed.exchange(false)) {
             try {
                 if (g_ch1) g_ch1.ValueChanged(g_tok1);
@@ -457,31 +545,36 @@ extern "C" __declspec(dllexport) bool __cdecl SubscribeCgxEeg(const wchar_t* dev
             }
         }
         g_svc = svcRes.Services().GetAt(0);
-
+        try {
+            if (auto sess = g_svc.Session()) sess.MaintainConnection(true);
+        }
+        catch (...) {}
         // Helper to bind a characteristic
         auto bindChar = [&](guid const& cuuid, GattCharacteristic& out, event_token& tok)->bool {
-            auto cres = g_svc.GetCharacteristicsForUuidAsync(cuuid, BluetoothCacheMode::Cached).get();
+            auto cres = g_svc.GetCharacteristicsForUuidAsync(cuuid, BluetoothCacheMode::Uncached).get();
             if (cres.Status() != GattCommunicationStatus::Success || cres.Characteristics().Size() == 0) {
-                cres = g_svc.GetCharacteristicsForUuidAsync(cuuid, BluetoothCacheMode::Uncached).get();
+                cres = g_svc.GetCharacteristicsForUuidAsync(cuuid, BluetoothCacheMode::Cached).get();
                 if (cres.Status() != GattCommunicationStatus::Success || cres.Characteristics().Size() == 0)
                     return false;
             }
-            out = cres.Characteristics().GetAt(0);
+            auto ch = cres.Characteristics().GetAt(0);
 
-            // Set CCCD = Notify
-            auto w = out.WriteClientCharacteristicConfigurationDescriptorAsync(
+            // Write CCCD = Notify
+            auto status = ch.WriteClientCharacteristicConfigurationDescriptorAsync(
                 GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-            if (w != GattCommunicationStatus::Success) return false;
+            if (status != GattCommunicationStatus::Success) return false;
 
-            // Hook ValueChanged → enqueue raw bytes
-            tok = out.ValueChanged([cuuid](auto const& sender, GattValueChangedEventArgs const& args) {
+            out = ch; // keep the same instance
+
+            // Hook ValueChanged → stitched queue
+            tok = out.ValueChanged([cuuid](auto const&, GattValueChangedEventArgs const& args) {
                 auto buf = args.CharacteristicValue();
                 auto len = buf ? buf.Length() : 0;
                 if (len == 0) return;
                 DataReader r = DataReader::FromBuffer(buf);
                 std::vector<uint8_t> v(len);
-                r.ReadBytes(v);
-                EnqueueChunk(std::move(v), cuuid);
+                r.ReadBytes(winrt::array_view<uint8_t>(v));
+                EnqueueAssembled(std::move(v));
             });
             return true;
         };
@@ -548,17 +641,14 @@ extern "C" __declspec(dllexport) bool __cdecl UnsubscribeCgxEeg(const wchar_t* /
         CloseIfIClosable(g_ch2);
         CloseIfIClosable(g_svc);
         CloseIfIClosable(g_dev);
-
-        // Clear data queue (as you already do)
-        {
-            std::lock_guard<std::mutex> lk(g_dataMx);
-            g_dataQ.clear(); g_queuedBytes = 0;
-        }
+        { std::lock_guard<std::mutex> lk(g_dataMx); g_dataQ.clear(); g_queuedBytes = 0; }
         ClearError();
+        RequestAssemblerReset();
         return true;
     }
     catch (hresult_error const& ex) { SaveError(L"UnsubscribeCgxEeg: %s", ex.message().c_str()); return false; }
     catch (...) { SaveError(L"UnsubscribeCgxEeg: unknown"); return false; }
+
 }
 
 extern "C" __declspec(dllexport) bool __cdecl PollData(BLEDataNative* out, bool /*block*/) {
