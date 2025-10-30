@@ -4,6 +4,6 @@
      Creating library E:\Lucidify\Source\LPatchDLL\LPatchDLL\x64\Release\LPatchDLL.lib and object E:\Lucidify\Source\LPatchDLL\LPatchDLL\x64\Release\LPatchDLL.exp
   Generating code
   Previous IPDB not found, fall back to full compilation.
-  All 1409 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  All 1415 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
   Finished generating code
   LPatchDLL.vcxproj -> E:\Lucidify\Source\LPatchDLL\LPatchDLL\x64\Release\LPatchDLL.dll

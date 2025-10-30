@@ -49,6 +49,19 @@ static std::vector<uint8_t> g_pktBuf;
 static bool                 g_haveSync = false;
 static const uint8_t        kSync = 0xFF;
 
+//================ Counters =======================
+static std::atomic<uint64_t> g_evtCount{ 0 };
+static std::atomic<uint64_t> g_evt703{ 0 };
+static std::atomic<uint64_t> g_evt704{ 0 };
+
+static std::atomic<uint64_t> g_notifyCount{ 0 };
+static std::atomic<uint64_t> g_frameCount{ 0 };
+
+static uint16_t g_lastLens[64] = {};
+static std::atomic<uint32_t> g_lenIdx{ 0 };
+
+//=================================================
+
 static void ClearError() { std::lock_guard<std::mutex> lk(g_errMx); wcscpy_s(g_err, L"OK"); }
 static void SaveError(const wchar_t* fmt, ...) {
     std::lock_guard<std::mutex> lk(g_errMx);
@@ -90,9 +103,21 @@ static void EnsureApartment()
     }
     s_apartmentInit = true;
 }
-static std::atomic<uint64_t> g_evtCount{ 0 };
-static std::atomic<uint64_t> g_evt703{ 0 };
-static std::atomic<uint64_t> g_evt704{ 0 };
+
+
+//============================ Counter Methods =======================
+extern "C" __declspec(dllexport) uint64_t __cdecl GetNotifyCount() { return g_notifyCount.load(); }
+extern "C" __declspec(dllexport) uint64_t __cdecl GetFrameCount() { return g_frameCount.load(); }
+extern "C" __declspec(dllexport) uint16_t __cdecl GetLastNotifyLen(int back)
+{
+    // back = 0 is latest, 1 is previous, etc.
+    uint32_t idx = g_lenIdx.load();
+    if (back < 0) back = 0;
+    if (back > 63) back = 63;
+    uint32_t pos = (idx - (uint32_t)back - 1) & 63;
+    return g_lastLens[pos];
+}
+
 
 extern "C" __declspec(dllexport) uint64_t __cdecl GetEvtCount() { return g_evtCount.load(); }
 extern "C" __declspec(dllexport) uint64_t __cdecl GetEvt703() { return g_evt703.load(); }
@@ -102,7 +127,7 @@ extern "C" __declspec(dllexport) void __cdecl GetError(ErrorMessage* outMsg) {
     std::lock_guard<std::mutex> lk(g_errMx);
     wcsncpy_s(outMsg->msg, _countof(outMsg->msg), g_err, _TRUNCATE);
 }
-
+//=====================================================================
 // -------------------- CGX UUIDs --------------------
 // <guiddef.h> via <windows.h> or <Unknwn.h>
 #define INITGUID
@@ -137,8 +162,6 @@ static constexpr size_t        kMaxQueuedBytes = (1u << 20); // 1 MB cap
 
 static std::atomic<DWORD> g_initTid{ 0 };   // thread that called Ble_Init
 static std::atomic<bool>  g_inited{ false };
-
-static std::atomic<uint64_t> g_frameCount{ 0 };
 
 // Feed raw BLE bytes (from either characteristic) and emit full 37B frames
 // Feed raw BLE bytes (from either characteristic) and emit frames delimited by sync (0xFF ... before next 0xFF)
@@ -183,8 +206,6 @@ static void EnqueueAssembled(std::vector<uint8_t>&& v, const guid& srcUuid)
         }
     }
 }
-
-extern "C" __declspec(dllexport) uint64_t __cdecl GetFrameCount() { return g_frameCount.load(); }
 
 extern "C" __declspec(dllexport) int __cdecl Ble_Ping() { return 42; }
 
@@ -681,13 +702,18 @@ extern "C" __declspec(dllexport) bool __cdecl SubscribeCgxEeg(const wchar_t* dev
             // Attach handler NOW to the refreshed instance
             out = ch;
             tok = out.ValueChanged([cuuid](auto const&, GattValueChangedEventArgs const& args) {
-                g_evtCount.fetch_add(1, std::memory_order_relaxed);
-                if (IsEqualGUID(cuuid, kCgxChar1Uuid)) g_evt703.fetch_add(1, std::memory_order_relaxed);
-                if (IsEqualGUID(cuuid, kCgxChar2Uuid)) g_evt704.fetch_add(1, std::memory_order_relaxed);
 
                 auto buf = args.CharacteristicValue();
                 auto len = buf ? buf.Length() : 0;
                 if (len == 0) return;
+
+                g_notifyCount.fetch_add(1, std::memory_order_relaxed);
+                uint32_t i = g_lenIdx.fetch_add(1, std::memory_order_relaxed) & 63;
+                g_lastLens[i] = (uint16_t)len;  // 'len' is the notify payload length
+
+                g_evtCount.fetch_add(1, std::memory_order_relaxed);
+                if (IsEqualGUID(cuuid, kCgxChar1Uuid)) g_evt703.fetch_add(1, std::memory_order_relaxed);
+                if (IsEqualGUID(cuuid, kCgxChar2Uuid)) g_evt704.fetch_add(1, std::memory_order_relaxed);
 
                 Windows::Storage::Streams::DataReader r = Windows::Storage::Streams::DataReader::FromBuffer(buf);
                 std::vector<uint8_t> v(len);
